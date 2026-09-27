@@ -1,0 +1,5 @@
+# The interface is a dark, low-glare lab tool, so the dark base theme is set
+# here rather than being patched with CSS. Everything else in the project is
+# styled with the theme's own variables, so it follows the palette below.
+[theme]
+base = "dark"
