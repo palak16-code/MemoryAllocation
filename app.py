@@ -1,17 +1,18 @@
 """
 app.py
 ------
-Streamlit interface for the Memory Allocation Simulator, organised as a small
-workspace of tabs:
+Streamlit interface for the Memory Allocation Simulator.
+
+Three pages, all reached from one tab bar:
 
 * **Home** collects the memory size, the process table and the algorithm, and
   opens a new Run tab when *Run Simulation* is pressed. A small house button in
   the tab bar always leads back here; Home is not itself a tab.
-* **Run n - <algorithm>** stays deliberately short: the memory-state table, the
-  six basic metrics, and a *View Detailed Metrics* button. The detail lives in a
-  full-screen overlay so the run page underneath is never crowded.
-* **Analysis** compares the four algorithms on one shared workload, with a
-  *View Analysis* button that turns the table into cards and a one-line verdict.
+* **Run n - <algorithm>** shows the memory map and table at the busiest moment
+  of the run, a row of figures, and a *Detailed Metrics* button. The detail
+  opens as an overlay so the run page underneath is never crowded.
+* **Analysis** replays one shared workload through all four algorithms and
+  tabulates the outcome.
 
 The process table is stored in ``workspace.py`` as plain data, never as widget
 state, so every run owns an independent snapshot of the workload it was
@@ -78,6 +79,17 @@ PROCESS_COLUMN_CONFIG = {
     ),
 }
 
+#: The one idea a rejected allocation has to convey.
+EXTERNAL_FRAGMENTATION = (
+    "External fragmentation: the free memory exists, but it is split into "
+    "separate blocks. Dynamic partitioning needs a single contiguous block, "
+    "so the request cannot be served."
+)
+OUT_OF_MEMORY = (
+    "The system was genuinely out of memory at that moment - the free memory "
+    "was smaller than the request."
+)
+
 
 # ---------------------------------------------------------------------------
 # Input handling
@@ -122,96 +134,36 @@ def read_processes(table: pd.DataFrame) -> tuple[list[Process], list[str]]:
 
 
 # ---------------------------------------------------------------------------
-# Explaining a failed allocation
+# Detailed metrics overlay
 # ---------------------------------------------------------------------------
-def failure_options(failure: dict, run: dict) -> list[str]:
-    """Short, verified ways to make one rejected process fit.
+def show_failure(failure: dict) -> None:
+    """One rejected process: the numbers, the layout, and the one reason.
 
-    Each entry is one option card, so the wording stays short. Anything that is
-    not checked against this run is stated conditionally, and no allocation
-    policy is ever promised to succeed.
+    Everything shown is the state of memory at the moment of the attempt, so
+    the figures cannot be explained away by later activity in the run.
     """
-    size = failure["size"]
-    occupied = failure["total_memory"] - failure["total_free"]
-    options = []
+    st.subheader(f"Allocation Failed: {failure['pid']}")
 
-    needed = occupied + size
-    if needed > failure["total_memory"]:
-        options.append(
-            f"Raise total memory to {needed} KB or more - {occupied} KB was "
-            f"already in use at time {failure['time']}, so {needed} KB is the "
-            f"smallest total that could hold everything at once."
+    st.table(
+        pd.DataFrame(
+            [
+                {
+                    "Process ID": failure["pid"],
+                    "Memory Required (KB)": failure["size"],
+                    "Arrival Time": failure["arrival"],
+                    "Attempt Time": failure["time"],
+                    "Total Free Memory (KB)": failure["total_free"],
+                    "Largest Contiguous Free Block (KB)":
+                        failure["largest_free_block"],
+                }
+            ]
         )
-    else:
-        options.append(
-            f"Make the free space contiguous - {failure['total_free']} KB was "
-            f"free at time {failure['time']}, but no single block reached "
-            f"{size} KB."
-        )
-
-    options.append(
-        f"Lower {failure['pid']}'s requirement to "
-        f"{failure['largest_free_block']} KB or less, the largest block that "
-        f"was free at that moment."
     )
 
-    still_running = [
-        entry
-        for entry in run["processes"]
-        if entry["pid"] != failure["pid"]
-        and entry["arrival"] < failure["arrival"]
-        and entry["arrival"] + entry["duration"] > failure["time"]
-    ]
-    if still_running:
-        who = ", ".join(
-            f"{entry['pid']} (finishes at time "
-            f"{entry['arrival'] + entry['duration']})"
-            for entry in still_running
-        )
-        options.append(
-            f"Free memory sooner by shortening {who} - "
-            f"{'it was' if len(still_running) == 1 else 'they were'} still "
-            f"running when {failure['pid']} asked for space."
-        )
-
-    options.append(
-        f"Compare policies with \"Run All Algorithms\" to see whether another "
-        f"policy lays the blocks out differently. It may or may not admit "
-        f"{failure['pid']}."
-    )
-    return options
-
-
-def show_failure_cards(failure: dict, run: dict) -> None:
-    """One rejected process, presented as evidence rather than as prose."""
-    cards.failure_banner(failure)
-    show_metrics(
-        {
-            "Total free memory": f"{failure['total_free']} KB",
-            "Largest contiguous block": f"{failure['largest_free_block']} KB",
-            "Process request": f"{failure['size']} KB",
-        }
-    )
-
-    cards.memory_bar(failure["blocks"], failure["largest_free_block"])
-    cards.comparison(failure["size"], failure["largest_free_block"])
-
-    if failure["total_free"] >= failure["size"]:
-        cards.note(
-            f"Total free memory ({failure['total_free']} KB) was actually larger "
-            f"than the {failure['size']} KB requested - it was split across "
-            f"separate holes. Dynamic partitioning needs one contiguous block, so "
-            f"this is external fragmentation."
-        )
-    else:
-        cards.note(
-            f"Memory was genuinely short at that moment: "
-            f"{failure['total_free']} KB free against {failure['size']} KB "
-            f"requested."
-        )
+    st.markdown("**Memory at the moment of the attempt**")
+    cards.memory_map(failure["blocks"], failure["largest_free_block"])
 
     if failure["holes"]:
-        st.markdown("**Contiguous free blocks at that time**")
         st.table(
             pd.DataFrame(
                 [
@@ -228,47 +180,52 @@ def show_failure_cards(failure: dict, run: dict) -> None:
     else:
         st.write("No memory was free at that time.")
 
-    st.markdown("**How this process could be allocated**")
-    cards.options(failure_options(failure, run))
+    st.code(
+        f"Requested: {failure['size']} KB"
+        f"   >   Largest contiguous block: {failure['largest_free_block']} KB",
+        language=None,
+    )
+    if failure["total_free"] >= failure["size"]:
+        st.caption(EXTERNAL_FRAGMENTATION)
+    else:
+        st.caption(OUT_OF_MEMORY)
 
 
 @st.dialog("Detailed Metrics", width="large", dismissible=False)
 def show_detailed_metrics(run: dict) -> None:
-    """The full-screen view of one run: run-wide figures, then every failure.
+    """The full-screen view of one run.
 
-    The dialog is not dismissible so that it can only be left through the Close
-    button, which clears the session flag and reruns the app - the Run tab
-    underneath is then exactly as the user left it.
+    Each rejected process is described once, with only the figures needed to
+    account for the rejection. The dialog is not dismissible so that it can
+    only be left through the Close button, which clears the session flag and
+    reruns the app - the Run tab underneath is then exactly as the user left it.
     """
-    left, right = st.columns([5, 1])
-    left.caption(
-        f"Run: {run['algorithm']}  |  {len(run['processes'])} processes  |  "
+    title, close = st.columns([6, 1])
+    title.caption(
+        f"{run['algorithm']}  |  {len(run['processes'])} processes  |  "
         f"{run['total_memory']} KB memory"
     )
-    if right.button("Close \u2715", key="detail_close_top", width="stretch"):
+    if close.button("Close \u2715", key="detail_close_top", width="stretch"):
         close_details()
 
-    show_metrics(
-        {
-            "Contiguous free blocks": run["free_blocks"],
-            "Largest free block": f"{run['largest_free_block']} KB",
-            "Memory in use at peak": f"{run['allocated']} KB",
-            "Peak reached at": f"time unit {run['shown_time']}",
-        }
-    )
-
     if run["failures"]:
-        st.divider()
-        st.caption(
-            "Every figure below describes memory as it was when the attempt was "
-            "made, not as it was at the end of the run."
-        )
-        for failure in run["failures"]:
-            show_failure_cards(failure, run)
+        for position, failure in enumerate(run["failures"]):
+            if position:
+                st.divider()
+            show_failure(failure)
     else:
-        st.success(
-            "Every process in this workload found a contiguous block large enough, "
-            "so there is nothing to explain."
+        st.write(
+            f"All {len(run['processes'])} processes were allocated - there is "
+            "nothing to explain."
+        )
+        show_metrics(
+            {
+                "Processes allocated": f"{run['successes']}/{len(run['processes'])}",
+                "Memory utilization": f"{run['utilisation']}%",
+                "Free memory": f"{run['free']} KB",
+                "Contiguous free blocks": run["free_blocks"],
+                "Largest free block": f"{run['largest_free_block']} KB",
+            }
         )
 
     st.divider()
@@ -327,77 +284,49 @@ def render_home() -> None:
 
 
 def render_run(tab: dict, run: dict) -> None:
-    """A Run tab: memory-state table, six metrics, one button, the actions."""
+    """A Run tab: memory map and table, figures, one button, the actions."""
     tab_id = tab["id"]
 
     st.subheader(f"Run: {run['algorithm']}")
     st.caption(
-        f"Workload: {len(run['processes'])} processes in {run['total_memory']} KB "
-        f"of memory."
-    )
-
-    st.subheader("Memory State")
-    st.caption(
         f"Memory at its most crowded moment - {len(run['blocks'])} blocks, "
         f"reached at time unit {run['shown_time']}."
     )
+    cards.memory_map(run["blocks"], run["largest_free_block"])
     st.table(pd.DataFrame(run["blocks"]).rename(columns=MEMORY_COLUMNS))
 
-    st.subheader("Metrics")
     show_metrics(
         {
             "Total memory": f"{run['total_memory']} KB",
-            "Allocated memory": f"{run['allocated']} KB",
-            "Free memory": f"{run['free']} KB",
-            "Memory utilization": f"{run['utilisation']}%",
-            "Successful allocations": run["successes"],
-            "Failed allocations": run["failures_count"],
+            "Allocated": f"{run['allocated']} KB",
+            "Free": f"{run['free']} KB",
+            "Utilization": f"{run['utilisation']}%",
+            "Allocated processes": run["successes"],
+            "Rejected processes": run["failures_count"],
         }
     )
 
-    if st.button(
-        "View Detailed Metrics", key=f"detail::{tab_id}", type="primary"
-    ):
+    if st.button("Detailed Metrics", key=f"detail::{tab_id}"):
         st.session_state[DETAIL_KEY] = tab_id
     if st.session_state.get(DETAIL_KEY) == tab_id:
         show_detailed_metrics(run)
 
     st.divider()
-    st.subheader("Actions")
     left, right = st.columns(2)
-
-    with left:
-        with st.container(border=True):
-            st.markdown("**Add more processes**")
-            st.caption("Add or edit processes, then run the simulation again.")
-            if st.button("Add More Processes", key=f"add::{tab_id}", width="stretch"):
-                workspace.show_tab(workspace.HOME_TAB)
-                st.rerun()
-
-    with right:
-        with st.container(border=True):
-            st.markdown("**Compare all algorithms**")
-            st.caption("Run the same workload through all four policies.")
-            if st.button(
-                "Run All Algorithms", key=f"compare::{tab_id}", width="stretch"
-            ):
-                workspace.add_analysis(
-                    run["total_memory"], workspace.processes_of(run)
-                )
-                st.rerun()
-
-    processes = workspace.processes_of(run)
-    total_memory = run["total_memory"]
-    algorithm = st.radio(
-        "Algorithm for the next run", ALGORITHM_ORDER, key=f"next::{tab_id}"
-    )
-    if st.button("Run Another Algorithm", key=f"again::{tab_id}"):
-        workspace.add_run(total_memory, processes, algorithm)
+    if left.button(
+        "New workload", key=f"add::{tab_id}", width="stretch"
+    ):
+        workspace.show_tab(workspace.HOME_TAB)
+        st.rerun()
+    if right.button(
+        "Compare all algorithms", key=f"compare::{tab_id}", width="stretch"
+    ):
+        workspace.add_analysis(run["total_memory"], workspace.processes_of(run))
         st.rerun()
 
 
 def show_algorithm_cards(analysis: dict) -> None:
-    """One bordered card per algorithm, showing the same facts as the table."""
+    """One bordered block per algorithm, showing the same facts as the table."""
     for row_start in range(0, len(analysis["rows"]), 2):
         pair = analysis["rows"][row_start : row_start + 2]
         for column, row in zip(st.columns(2), pair):
@@ -406,43 +335,41 @@ def show_algorithm_cards(analysis: dict) -> None:
                     st.markdown(f"**{row['Algorithm']}**")
                     show_metrics(
                         {
-                            "Successful": row["Successful Allocations"],
-                            "Failed": row["Failed Allocations"],
+                            "Allocated": row["Successful Allocations"],
+                            "Rejected": row["Failed Allocations"],
                             "Utilization": f"{row['Memory Utilization']}%",
                         }
                     )
                     st.caption(
-                        f"Peak {row['allocated']} KB in use at time unit "
-                        f"{row['shown_time']}  |  largest free block "
-                        f"{row['largest_free_block']} KB  |  "
-                        f"{row['free_blocks']} free block(s)  |  "
-                        f"{row['Free Memory']} KB free"
+                        f"Largest free block {row['largest_free_block']} KB in "
+                        f"{row['free_blocks']} block(s)  |  "
+                        f"{row['reject_note']}"
                     )
-                    st.markdown(row["reject_note"])
 
 
 def render_analysis(analysis: dict) -> None:
     """An Analysis tab: the four algorithms compared on one shared workload."""
     st.subheader("Algorithm Comparison")
-    table = pd.DataFrame(analysis["rows"])[COMPARISON_COLUMNS]
-    st.table(table)
-    st.bar_chart(table, x="Algorithm", y="Memory Utilization", color="Algorithm")
+    st.table(pd.DataFrame(analysis["rows"])[COMPARISON_COLUMNS])
 
-    if st.button("View Analysis", type="primary"):
-        st.subheader("Results")
-        show_algorithm_cards(analysis)
+    st.caption(workspace.verdict(analysis))
+    if not workspace.identical_results(analysis):
+        # Four identical bars carry no information, so the chart is only drawn
+        # when the algorithms actually disagreed on something.
+        table = pd.DataFrame(analysis["rows"])[COMPARISON_COLUMNS]
+        st.bar_chart(table, x="Algorithm", y="Memory Utilization",
+                     color="Algorithm")
 
-        st.markdown("**Comparison summary**")
-        st.code("\n".join(workspace.summary_lines(analysis)), language=None)
-        st.caption(workspace.verdict(analysis))
+    show_algorithm_cards(analysis)
 
 
 # ---------------------------------------------------------------------------
 # Page
 # ---------------------------------------------------------------------------
 st.title("Memory Allocation Simulator")
-st.write(
-    "Simulation of dynamic memory allocation techniques in Operating Systems."
+st.caption(
+    "Dynamic memory allocation in Operating Systems: "
+    "First Fit - Best Fit - Worst Fit - Next Fit"
 )
 
 cards.render_styles()

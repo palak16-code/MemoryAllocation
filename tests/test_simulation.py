@@ -27,9 +27,16 @@ from analysis.metrics import (  # noqa: E402
     to_comparison_table,
     utilisation_percent,
 )
-from simulation.memory_manager import MemoryManager  # noqa: E402
+from simulation.memory_manager import MemoryBlock, MemoryManager  # noqa: E402
 from simulation.process_manager import Process, validate_workload  # noqa: E402
 from simulation.simulator import run_all_algorithms, run_simulation  # noqa: E402
+from workspace import (  # noqa: E402
+    ARRIVAL_COLUMN,
+    DEFAULT_WORKLOAD,
+    DURATION_COLUMN,
+    ID_COLUMN,
+    SIZE_COLUMN,
+)
 
 PASSED: list[str] = []
 FAILED: list[str] = []
@@ -338,10 +345,108 @@ def test_comparison() -> None:
 
 
 # ---------------------------------------------------------------------------
-# 10. Input validation
+# 11. The four policies really do select different blocks
+# ---------------------------------------------------------------------------
+def test_policy_divergence() -> None:
+    """Prove the four strategies are genuinely different selection policies.
+
+    A workload can only tell the policies apart if, at some point, more than
+    one free block is large enough for the arriving request. Everything below
+    is checked against one such layout, and then against the workload the
+    application actually starts with - no result is ever asserted that the
+    allocation logic did not produce.
+    """
+    print("\n[11] Policy divergence")
+
+    # Two suitable free blocks of different sizes (500 and 400), plus one that
+    # is too small (120) and must be ignored by every policy.
+    def layout() -> list:
+        return [
+            MemoryBlock(0, 300, "A"),
+            MemoryBlock(300, 120),
+            MemoryBlock(420, 500),
+            MemoryBlock(920, 400),
+        ]
+
+    chosen = {
+        name: get_algorithm(name).select_block(layout(), 250)
+        for name in ("First Fit", "Best Fit", "Worst Fit", "Next Fit")
+    }
+    check("First Fit takes the lowest-addressed block that fits",
+          chosen["First Fit"] == 2, str(chosen))
+    check("Best Fit takes the smallest block that fits",
+          chosen["Best Fit"] == 3, str(chosen))
+    check("Worst Fit takes the largest block that fits",
+          chosen["Worst Fit"] == 2, str(chosen))
+    check("Next Fit starts from address 0, so it matches First Fit here",
+          chosen["Next Fit"] == 2, str(chosen))
+
+    # Next Fit is the only one of the four that can skip a hole: once its
+    # pointer has moved past the 500 KB block it no longer considers it.
+    nf = get_algorithm("Next Fit")
+    nf.select_block(layout(), 500)               # pointer -> 920
+    check("Next Fit skips a hole behind its pointer where First Fit does not",
+          nf.select_block(layout(), 250) == 3
+          and get_algorithm("First Fit").select_block(layout(), 250) == 2,
+          f"pointer={nf.next_address}")
+
+    # --- the same check, end to end, on the shipped workload ---------------
+    workload = [
+        Process(str(row[ID_COLUMN]), int(row[SIZE_COLUMN]),
+                int(row[ARRIVAL_COLUMN]), int(row[DURATION_COLUMN]))
+        for row in DEFAULT_WORKLOAD.to_dict("records")
+    ]
+    results = run_all_algorithms(1000, workload)
+    placements = {
+        name: tuple(
+            (r["pid"], r["block_start"])
+            for r in res.records
+            if r.get("action") == "Allocate" and r["success"]
+        )
+        for name, res in results.items()
+    }
+    check("the four algorithms do not place the workload identically",
+          len(set(placements.values())) > 1, str(placements))
+    check("at least three distinct layouts appear across the four algorithms",
+          len(set(placements.values())) >= 3, str(placements))
+
+    # The workload is only discriminating if some request had a genuine
+    # choice between differently sized blocks that both satisfied it.
+    ambiguous = 0
+    shortfalls = []
+    for res in results.values():
+        for record in res.records:
+            if record.get("action") != "Allocate":
+                continue
+            snapshot = next(s for s in res.history if s.time == record["time"])
+            suitable = {
+                block.size for block in snapshot.blocks
+                if block.is_free and block.size >= record["size"]
+            }
+            if len(suitable) > 1:
+                ambiguous += 1
+            if not record["success"]:
+                shortfalls.append(
+                    (record["pid"], record["size"], snapshot.free_memory,
+                     snapshot.largest_free_block)
+                )
+    check("the workload offers a choice of differently sized suitable blocks",
+          ambiguous > 0, f"requests with a real choice={ambiguous}")
+    check("at least one process is rejected on this workload",
+          bool(shortfalls), str(shortfalls))
+    check("every rejection is external fragmentation, not a shortage",
+          all(free >= size for _, size, free, _ in shortfalls), str(shortfalls))
+    check("at least one policy places the whole workload",
+          max(res.metrics["processes_allocated"] for res in results.values())
+          == len(workload),
+          str([r.metrics["processes_allocated"] for r in results.values()]))
+
+
+# ---------------------------------------------------------------------------
+# 12. Input validation
 # ---------------------------------------------------------------------------
 def test_validation() -> None:
-    print("\n[10] Input validation")
+    print("\n[12] Input validation")
     check("empty workload is reported",
           len(validate_workload([])) == 1)
     dup = [Process("P1", 100, 0, 1), Process("P1", 100, 1, 1)]
@@ -369,7 +474,8 @@ def main() -> int:
     for test in (
         test_first_fit, test_best_fit, test_worst_fit, test_next_fit,
         test_allocation_failure, test_compaction, test_simulator_lifecycle,
-        test_stepping, test_comparison, test_validation,
+        test_stepping, test_comparison, test_policy_divergence,
+        test_validation,
     ):
         test()
 

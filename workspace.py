@@ -51,6 +51,7 @@ COMPARISON_COLUMNS = [
     "Failed Allocations",
     "Memory Utilization",
     "Free Memory",
+    "Largest Free Block (KB)",
 ]
 
 #: Column names of the editable process table.
@@ -59,12 +60,25 @@ SIZE_COLUMN = "Memory Required (KB)"
 ARRIVAL_COLUMN = "Arrival Time"
 DURATION_COLUMN = "Duration"
 
+#: The workload the application starts with.
+#:
+#: It is deliberately *discriminating*: it is chosen so that more than one free
+#: block of a different size is large enough at the same moment, which is the
+#: only situation in which First Fit, Best Fit, Worst Fit and Next Fit are
+#: forced into different choices. On this workload Best Fit and Next Fit
+#: allocate every process, while First Fit and Worst Fit reject P6 - and the
+#: rejection is caused by external fragmentation, not by a shortage of memory.
+#: A workload whose processes all arrive at t = 0 would instead leave memory as
+#: one single free block until the first completion, and all four algorithms
+#: would then be indistinguishable.
 DEFAULT_WORKLOAD = pd.DataFrame(
     [
-        {ID_COLUMN: "P1", SIZE_COLUMN: 200, ARRIVAL_COLUMN: 0, DURATION_COLUMN: 5},
-        {ID_COLUMN: "P2", SIZE_COLUMN: 150, ARRIVAL_COLUMN: 1, DURATION_COLUMN: 3},
-        {ID_COLUMN: "P3", SIZE_COLUMN: 300, ARRIVAL_COLUMN: 2, DURATION_COLUMN: 4},
-        {ID_COLUMN: "P4", SIZE_COLUMN: 100, ARRIVAL_COLUMN: 3, DURATION_COLUMN: 2},
+        {ID_COLUMN: "P1", SIZE_COLUMN: 350, ARRIVAL_COLUMN: 0, DURATION_COLUMN: 3},
+        {ID_COLUMN: "P2", SIZE_COLUMN: 250, ARRIVAL_COLUMN: 2, DURATION_COLUMN: 5},
+        {ID_COLUMN: "P3", SIZE_COLUMN: 100, ARRIVAL_COLUMN: 3, DURATION_COLUMN: 3},
+        {ID_COLUMN: "P4", SIZE_COLUMN: 300, ARRIVAL_COLUMN: 3, DURATION_COLUMN: 4},
+        {ID_COLUMN: "P5", SIZE_COLUMN: 100, ARRIVAL_COLUMN: 4, DURATION_COLUMN: 6},
+        {ID_COLUMN: "P6", SIZE_COLUMN: 250, ARRIVAL_COLUMN: 4, DURATION_COLUMN: 1},
     ],
 )
 
@@ -293,10 +307,9 @@ def add_analysis(total_size: int, processes: Sequence[Process]) -> str:
                 "Failed Allocations": result["failures_count"],
                 "Memory Utilization": result["utilisation"],
                 "Free Memory": result["free"],
+                "Largest Free Block (KB)": result["largest_free_block"],
                 "free_blocks": result["free_blocks"],
                 "largest_free_block": result["largest_free_block"],
-                "allocated": result["allocated"],
-                "shown_time": result["shown_time"],
                 "reject_note": reject_note(result["failures"]),
             }
         )
@@ -336,40 +349,37 @@ def _joined(names: Sequence[str]) -> str:
 
 
 def reject_note(failures: Sequence[dict]) -> str:
-    """One short line saying what went wrong, taken from the numbers.
-
-    Kept deliberately short: the overlay shows the evidence as cards, so the
-    text only has to name the outcome.
-    """
+    """One short line saying what went wrong, taken from the numbers."""
     if not failures:
         return "Every process in the workload was allocated."
     first = failures[0]
     extra = f" (+{len(failures) - 1} more)" if len(failures) > 1 else ""
     return (
-        f"{first['pid']} was rejected: {first['size']} KB requested, but the "
-        f"largest contiguous free block was {first['largest_free_block']} KB"
-        f"{extra}."
+        f"{first['pid']} was rejected: {first['size']} KB requested, largest "
+        f"contiguous free block {first['largest_free_block']} KB{extra}."
     )
 
 
-def summary_lines(analysis: dict) -> List[str]:
-    """The comparison as one aligned line per algorithm - figures, not prose."""
-    rows = analysis["rows"]
-    width = max(len(row["Algorithm"]) for row in rows)
+#: Sent verbatim when the four policies cannot be told apart on a workload.
+IDENTICAL_VERDICT = (
+    "All four algorithms produced the same result for this workload."
+)
 
-    lines = [
-        f"WORKLOAD   {analysis['process_count']} processes  |  "
-        f"{analysis['total_memory']} KB memory",
-        "",
-    ]
-    for row in rows:
-        lines.append(
-            f"{row['Algorithm']:<{width}}   "
-            f"{row['Successful Allocations']} successful  |  "
-            f"{row['Failed Allocations']} failed  |  "
-            f"{row['Memory Utilization']}% used"
-        )
-    return lines
+
+def _signature(row: dict) -> tuple:
+    """The figures that decide whether two runs came out the same."""
+    return (
+        row["Successful Allocations"],
+        row["Failed Allocations"],
+        row["Memory Utilization"],
+        row["Free Memory"],
+        row["Largest Free Block (KB)"],
+    )
+
+
+def identical_results(analysis: dict) -> bool:
+    """True when all four algorithms produced the same reported outcome."""
+    return len({_signature(row) for row in analysis["rows"]}) == 1
 
 
 def verdict(analysis: dict) -> str:
@@ -379,13 +389,8 @@ def verdict(analysis: dict) -> str:
     results are reported as equal.
     """
     rows = analysis["rows"]
-    same = {
-        (row["Successful Allocations"], row["Failed Allocations"],
-         row["Memory Utilization"], row["Free Memory"])
-        for row in rows
-    }
-    if len(same) == 1:
-        return "All four algorithms produced the same allocation result for this workload."
+    if identical_results(analysis):
+        return IDENTICAL_VERDICT
 
     most, fewest = (
         max(rows, key=lambda r: r["Successful Allocations"]),
